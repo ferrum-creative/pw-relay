@@ -33,8 +33,8 @@
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 12px; }
   .sub { color: var(--sub); font-size: 14px; margin: 6px 0 0; }
   .fp {
-    font: 700 32px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    letter-spacing: 0.08em; text-align: center; background: var(--code-bg);
+    font: 700 24px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    letter-spacing: 0.04em; text-align: center; background: var(--code-bg);
     border-radius: 8px; padding: 12px 8px; user-select: all;
   }
   input[type=password], textarea {
@@ -77,8 +77,8 @@
   <div id="app" hidden>
     <section class="card">
       <h2>1. 確認コード</h2>
-      <div id="fp" class="fp">---- ----</div>
-      <p class="sub">会議の相手が読み上げるコードと<strong>同じ</strong>であることを確かめてください。違う場合は、パスワードを入力しないでください。</p>
+      <div id="fp" class="fp">---- ---- ---- ----</div>
+      <p class="sub">この16桁を会議で読み上げ、相手のコードと<strong>全部同じ</strong>であることを確かめてください。違う場合は、パスワードを入力しないでください。</p>
     </section>
 
     <section class="card">
@@ -109,6 +109,31 @@
   var HASH_LEN = 32;          // SHA-256
   var KEY_BYTES = 384;        // RSA 3072bit
   var PREFIX = 'PWR1:';
+  var FP_BYTES = 8;           // 確認コード = SHA-256 の先頭 64bit (16桁)
+
+  // 2000 未満の奇素数。まともな RSA の modulus はこれらで割り切れない
+  var SMALL_PRIMES = (function () {
+    var list = [];
+    for (var c = 3; c < 2000; c += 2) {
+      var prime = true;
+      for (var d = 3; d * d <= c; d += 2) { if (c % d === 0) { prime = false; break; } }
+      if (prime) { list.push(c); }
+    }
+    return list;
+  })();
+
+  // 明らかに RSA の鍵でない modulus (偶数・小さな素数で割り切れる) を弾く簡易チェック。
+  // すり替え対策の本体は確認コードの照合で、これは補助。
+  function looksLikeRsaModulus(bytes) {
+    if ((bytes[bytes.length - 1] & 1) === 0) { return false; }
+    for (var i = 0; i < SMALL_PRIMES.length; i++) {
+      var p = SMALL_PRIMES[i];
+      var r = 0;
+      for (var j = 0; j < bytes.length; j++) { r = (r * 256 + bytes[j]) % p; }
+      if (r === 0) { return false; }
+    }
+    return true;
+  }
 
   function $(id) { return document.getElementById(id); }
 
@@ -161,6 +186,7 @@
       if (!/^[A-Za-z0-9_-]+$/.test(p.n) || p.e !== 'AQAB') { throw new Error('format'); }
       nBytes = b64urlToBytes(p.n);
       if (nBytes.length !== KEY_BYTES || (nBytes[0] & 0x80) === 0) { throw new Error('size'); }
+      if (!looksLikeRsaModulus(nBytes)) { throw new Error('modulus'); }
       publicKey = await crypto.subtle.importKey(
         'jwk',
         { kty: 'RSA', n: p.n, e: p.e, alg: 'RSA-OAEP-256', ext: true },
@@ -177,9 +203,8 @@
 
     var digest = new Uint8Array(await crypto.subtle.digest('SHA-256', nBytes));
     var hex = '';
-    for (var i = 0; i < 4; i++) { hex += ('0' + digest[i].toString(16)).slice(-2); }
-    hex = hex.toUpperCase();
-    $('fp').textContent = hex.slice(0, 4) + ' ' + hex.slice(4);
+    for (var i = 0; i < FP_BYTES; i++) { hex += ('0' + digest[i].toString(16)).slice(-2); }
+    $('fp').textContent = hex.toUpperCase().match(/.{4}/g).join(' ');
     $('app').hidden = false;
   }
 

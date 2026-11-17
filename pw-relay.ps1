@@ -14,14 +14,21 @@
 
 .PARAMETER PageUrl
     docs/index.html を公開している GitHub Pages のURL。
-    毎回指定するのが面倒なら、下の param の既定値を書き換える。
+    https:// のみ受け付ける (ローカルテスト用の http://localhost は例外)。
+
+.PARAMETER ClearAfterSeconds
+    復号結果をクリップボードに置いておく最長時間 (秒)。Enter を押さなくても、
+    この時間が過ぎると自動で消去して終了する。0 を指定すると自動消去しない。
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\pw-relay.ps1 -PageUrl https://example.github.io/pw-relay/
 #>
 [CmdletBinding()]
 param(
-    [string]$PageUrl = 'https://YOUR-ACCOUNT.github.io/pw-relay/'
+    [string]$PageUrl = 'https://ferrum-creative.github.io/pw-relay/',
+
+    [ValidateRange(0, 3600)]
+    [int]$ClearAfterSeconds = 60
 )
 
 Set-StrictMode -Version 2.0
@@ -91,6 +98,44 @@ function Clear-ClipboardQuietly {
             Start-Sleep -Milliseconds 100
         }
     }
+    # 消去できないときは、せめて無害な文字で上書きを試みる
+    try {
+        [System.Windows.Forms.Clipboard]::SetDataObject(' ', $true, 10, 100)
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+# Enter が押されるか制限時間が過ぎるまで待つ。Enter なら $true、時間切れなら $false。
+# 短い間隔で区切って待つので、途中の Ctrl+C にもすぐ反応する。
+function Wait-EnterOrTimeout {
+    param([int]$Seconds)
+
+    if ($Seconds -le 0) {
+        [void](Read-Host '    Enter で消去して終了')
+        return $true
+    }
+    $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
+
+    if ([Console]::IsInputRedirected) {
+        # 標準入力がパイプやファイルのとき (自動テスト用)
+        $buffer = New-Object byte[] 256
+        $task = [Console]::OpenStandardInput().ReadAsync($buffer, 0, $buffer.Length)
+        while ([DateTime]::UtcNow -lt $deadline) {
+            if ($task.Wait(200)) { return $true }
+        }
+        return $false
+    }
+
+    # 先に押されていたキーは捨てる (うっかり押した Enter で即消去されないように)
+    while ([Console]::KeyAvailable) { [void][Console]::ReadKey($true) }
+    while ([DateTime]::UtcNow -lt $deadline) {
+        while ([Console]::KeyAvailable) {
+            if ([Console]::ReadKey($true).Key -eq [ConsoleKey]::Enter) { return $true }
+        }
+        Start-Sleep -Milliseconds 100
+    }
     return $false
 }
 
@@ -100,10 +145,10 @@ if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne [Threading.Apartme
     Write-Host 'クリップボードを使うには STA モードが必要です。powershell.exe から (-MTA を付けずに) 実行してください。' -ForegroundColor Red
     exit 1
 }
-if ($PageUrl -match 'YOUR-ACCOUNT' -or $PageUrl -notmatch '^https?://') {
-    Write-Host '暗号化ページのURLが設定されていません。' -ForegroundColor Red
+if ($PageUrl -notmatch '^(https://|http://(localhost|127\.0\.0\.1)(:\d+)?/)') {
+    Write-Host '暗号化ページのURLは https:// で始まる必要があります (http では配信途中でページを書き換えられるため)。' -ForegroundColor Red
     Write-Host '  -PageUrl https://<アカウント名>.github.io/pw-relay/ を付けて実行するか、'
-    Write-Host '  スクリプト冒頭の param の既定値を書き換えてください。'
+    Write-Host '  スクリプト冒頭の param の既定値を https:// のURLに書き換えてください。'
     exit 1
 }
 $baseUrl = ($PageUrl -split '#')[0]
@@ -125,15 +170,16 @@ try {
     $url = '{0}#n={1}&e={2}' -f $baseUrl, (ConvertTo-Base64Url $pub.Modulus), (ConvertTo-Base64Url $pub.Exponent)
     [System.Windows.Forms.Clipboard]::SetDataObject($url, $true, 10, 100)
 
-    # 3. 指紋 (modulus の SHA-256 の先頭8桁)
+    # 3. 指紋 (modulus の SHA-256 の先頭16桁 = 64bit)。
+    #    8桁 (32bit) では、同じ指紋になる偽の鍵を短時間で作れてしまう
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
         $hash = $sha.ComputeHash($pub.Modulus)
     } finally {
         $sha.Dispose()
     }
-    $hex = -join ($hash[0..3] | ForEach-Object { $_.ToString('X2') })
-    $fingerprint = $hex.Substring(0, 4) + ' ' + $hex.Substring(4, 4)
+    $hex = -join ($hash[0..7] | ForEach-Object { $_.ToString('X2') })
+    $fingerprint = ($hex -split '(.{4})' | Where-Object { $_ }) -join ' '
 
     Write-Host ''
     Write-Host '[1] URLをクリップボードにコピーしました。Teams のチャットに貼り付けて相手に送ってください。'
@@ -155,6 +201,15 @@ try {
             $clip = [System.Windows.Forms.Clipboard]::GetText()
         } catch {
             Write-Host '    クリップボードを読み取れませんでした。もう一度お試しください。' -ForegroundColor Yellow
+            continue
+        }
+
+        # 暗号文が2つ以上あるときは、どれを使うか決めつけずにやり直してもらう
+        if ([regex]::Matches([string]$clip, [regex]::Escape($Prefix)).Count -gt 1) {
+            $clip = $null
+            Write-Host "    クリップボードに暗号文 ($Prefix...) が複数含まれています。" -ForegroundColor Yellow
+            Write-Host '    相手が最後に送った1つだけをコピーし直してください。' -ForegroundColor Yellow
+            Write-Host ''
             continue
         }
 
@@ -202,7 +257,14 @@ try {
     Write-Host ''
 
     # 6. 貼り付けが済んだら消去 (実際の後始末は finally で行う)
-    [void](Read-Host '    貼り付けが終わったら Enter (クリップボードを消去して終了します)')
+    if ($ClearAfterSeconds -gt 0) {
+        Write-Host "    貼り付けが終わったら Enter を押してください。押さなくても $ClearAfterSeconds 秒後に自動で消去します。"
+    } else {
+        Write-Host '    貼り付けが終わったら Enter を押してください (クリップボードを消去して終了します)。'
+    }
+    if (-not (Wait-EnterOrTimeout -Seconds $ClearAfterSeconds)) {
+        Write-Host "    $ClearAfterSeconds 秒たったので自動で消去します。" -ForegroundColor Yellow
+    }
 }
 finally {
     # 7. Ctrl+C で中断されても必ずここを通る
