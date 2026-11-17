@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
+<meta name="format-detection" content="telephone=no">
+<title>パスワード中継</title>
+<style>
+  :root {
+    --bg: #f4f5f7; --card: #ffffff; --fg: #1b1f24; --sub: #5b6470;
+    --line: #d0d5dc; --accent: #0b5cad; --accent-fg: #ffffff;
+    --ok: #17703a; --err-bg: #fdecec; --err-fg: #a11919; --code-bg: #eef2f7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171b; --card: #1e2227; --fg: #e8ebef; --sub: #a0a8b3;
+      --line: #3a414a; --accent: #4f9fe8; --accent-fg: #0b1118;
+      --ok: #5fd08a; --err-bg: #3a1a1a; --err-fg: #ffb3b3; --code-bg: #2a3038;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0; padding: 16px; background: var(--bg); color: var(--fg);
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Noto Sans JP", "Yu Gothic UI", sans-serif;
+  }
+  main { max-width: 520px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 4px 0 12px; }
+  h2 { font-size: 16px; margin: 0 0 8px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 12px; }
+  .sub { color: var(--sub); font-size: 14px; margin: 6px 0 0; }
+  .fp {
+    font: 700 32px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    letter-spacing: 0.08em; text-align: center; background: var(--code-bg);
+    border-radius: 8px; padding: 12px 8px; user-select: all;
+  }
+  input[type=password], textarea {
+    width: 100%; font-size: 16px; padding: 12px; color: var(--fg); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 8px;
+  }
+  input[type=password] { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  textarea { font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; height: 120px; resize: none; word-break: break-all; }
+  label.chk { display: inline-flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 14px; }
+  label.chk input { width: 20px; height: 20px; }
+  .reveal {
+    margin-top: 8px; padding: 10px 12px; border: 1px dashed var(--line); border-radius: 8px; min-height: 44px;
+    font: 18px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    white-space: pre-wrap; word-break: break-all;
+  }
+  button {
+    width: 100%; margin-top: 12px; padding: 14px; font-size: 17px; font-weight: 700;
+    color: var(--accent-fg); background: var(--accent); border: 0; border-radius: 10px;
+  }
+  button:disabled { opacity: 0.5; }
+  .msg { font-size: 14px; margin: 8px 0 0; min-height: 1.6em; }
+  .msg.ok { color: var(--ok); font-weight: 700; }
+  .msg.ng { color: var(--err-fg); font-weight: 700; }
+  .error { background: var(--err-bg); color: var(--err-fg); border-color: var(--err-fg); }
+  footer { color: var(--sub); font-size: 12px; text-align: center; margin: 16px 0; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>パスワード中継</h1>
+
+  <noscript><div class="card error">このページは JavaScript を有効にしないと使えません。</div></noscript>
+
+  <div id="error" class="card error" hidden>
+    <h2>このページは使えません</h2>
+    <div id="errorText"></div>
+  </div>
+
+  <div id="app" hidden>
+    <section class="card">
+      <h2>1. 確認コード</h2>
+      <div id="fp" class="fp">---- ----</div>
+      <p class="sub">会議の相手が読み上げるコードと<strong>同じ</strong>であることを確かめてください。違う場合は、パスワードを入力しないでください。</p>
+    </section>
+
+    <section class="card">
+      <h2>2. パスワードを入力</h2>
+      <input id="pw" type="password" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" aria-label="パスワード">
+      <label class="chk"><input id="show" type="checkbox">入力した文字を表示する</label>
+      <div id="reveal" class="reveal" hidden aria-live="off"></div>
+      <button id="enc" type="button">暗号化する</button>
+      <p id="encMsg" class="msg ng"></p>
+    </section>
+
+    <section id="result" class="card" hidden>
+      <h2>3. 暗号文をコピーして送る</h2>
+      <textarea id="out" readonly aria-label="暗号文"></textarea>
+      <button id="copy" type="button">コピー</button>
+      <p id="copyMsg" class="msg"></p>
+      <p class="sub">コピーした暗号文を、会議のチャットにそのまま貼り付けて送信してください。暗号文は相手のPCでしか元に戻せません。</p>
+    </section>
+  </div>
+
+  <footer>このページは通信を一切行いません。入力した内容はこの端末の中で暗号化されます。</footer>
+</main>
+
+<script>
+(function () {
+  'use strict';
+
+  var HASH_LEN = 32;          // SHA-256
+  var KEY_BYTES = 384;        // RSA 3072bit
+  var PREFIX = 'PWR1:';
+
+  function $(id) { return document.getElementById(id); }
+
+  function b64urlToBytes(s) {
+    var b = s.replace(/-/g, '+').replace(/_/g, '/');
+    while (b.length % 4) { b += '='; }
+    var bin = atob(b);
+    var out = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) { out[i] = bin.charCodeAt(i); }
+    return out;
+  }
+
+  function bytesToB64(bytes) {
+    var s = '';
+    for (var i = 0; i < bytes.length; i++) { s += String.fromCharCode(bytes[i]); }
+    return btoa(s);
+  }
+
+  function parseFragment() {
+    var out = {};
+    var h = location.hash.replace(/^#/, '');
+    h.split('&').forEach(function (part) {
+      var i = part.indexOf('=');
+      if (i > 0) { out[part.slice(0, i)] = part.slice(i + 1); }
+    });
+    return out;
+  }
+
+  function fail(text) {
+    $('errorText').textContent = text;
+    $('error').hidden = false;
+    $('app').hidden = true;
+  }
+
+  var publicKey = null;
+  var maxBytes = 0;
+
+  async function init() {
+    if (!window.crypto || !crypto.subtle || !window.TextEncoder) {
+      fail('このブラウザーは暗号化機能に対応していません。iPhone は Safari、Android は Chrome で、https:// から始まるURLを開いてください。');
+      return;
+    }
+    var p = parseFragment();
+    if (!p.n || !p.e) {
+      fail('URLに鍵の情報がありません。送られてきたURLを、最後の文字まで全部コピーして開き直してください。');
+      return;
+    }
+    var nBytes;
+    try {
+      if (!/^[A-Za-z0-9_-]+$/.test(p.n) || p.e !== 'AQAB') { throw new Error('format'); }
+      nBytes = b64urlToBytes(p.n);
+      if (nBytes.length !== KEY_BYTES || (nBytes[0] & 0x80) === 0) { throw new Error('size'); }
+      publicKey = await crypto.subtle.importKey(
+        'jwk',
+        { kty: 'RSA', n: p.n, e: p.e, alg: 'RSA-OAEP-256', ext: true },
+        { name: 'RSA-OAEP', hash: 'SHA-256' },
+        false,
+        ['encrypt']
+      );
+    } catch (err) {
+      publicKey = null;
+      fail('URLの鍵の情報が壊れています。URLが途中で切れていないか確かめて、もう一度送ってもらってください。');
+      return;
+    }
+    maxBytes = nBytes.length - 2 * HASH_LEN - 2;
+
+    var digest = new Uint8Array(await crypto.subtle.digest('SHA-256', nBytes));
+    var hex = '';
+    for (var i = 0; i < 4; i++) { hex += ('0' + digest[i].toString(16)).slice(-2); }
+    hex = hex.toUpperCase();
+    $('fp').textContent = hex.slice(0, 4) + ' ' + hex.slice(4);
+    $('app').hidden = false;
+  }
+
+  function updateReveal() {
+    var on = $('show').checked;
+    $('reveal').hidden = !on;
+    $('reveal').textContent = on ? $('pw').value : '';
+  }
+
+  async function encrypt() {
+    var msg = $('encMsg');
+    msg.textContent = '';
+    if (!publicKey) { return; }
+    var value = $('pw').value;
+    if (value.length === 0) { msg.textContent = 'パスワードを入力してください。'; return; }
+    var data = new TextEncoder().encode(value);
+    if (data.length > maxBytes) {
+      data.fill(0);
+      msg.textContent = '長すぎて暗号化できません(最大 ' + maxBytes + ' バイト)。';
+      return;
+    }
+    $('enc').disabled = true;
+    try {
+      var ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'RSA-OAEP' }, publicKey, data));
+      $('out').value = PREFIX + bytesToB64(ct);
+      // 暗号化できたら平文を画面から消す
+      $('pw').value = '';
+      $('show').checked = false;
+      updateReveal();
+      $('copyMsg').textContent = '';
+      $('copyMsg').className = 'msg';
+      $('result').hidden = false;
+      $('result').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } catch (err) {
+      msg.textContent = '暗号化に失敗しました。ページを開き直してやり直してください。';
+    } finally {
+      data.fill(0);
+      $('enc').disabled = false;
+    }
+  }
+
+  async function copyOut() {
+    var out = $('out');
+    var msg = $('copyMsg');
+    var ok = false;
+    try {
+      await navigator.clipboard.writeText(out.value);
+      ok = true;
+    } catch (err) {
+      try {
+        out.focus();
+        out.select();
+        out.setSelectionRange(0, out.value.length);
+        ok = document.execCommand('copy');
+      } catch (err2) { ok = false; }
+    }
+    if (ok) {
+      msg.className = 'msg ok';
+      msg.textContent = 'コピーしました。チャットに貼り付けて送信してください。';
+    } else {
+      msg.className = 'msg ng';
+      msg.textContent = '自動でコピーできませんでした。上の枠を長押しして「すべて選択」→「コピー」してください。';
+    }
+  }
+
+  $('pw').addEventListener('input', updateReveal);
+  $('pw').addEventListener('keydown', function (ev) {
+    if (ev.key === 'Enter') { ev.preventDefault(); encrypt(); }
+  });
+  $('show').addEventListener('change', updateReveal);
+  $('enc').addEventListener('click', encrypt);
+  $('copy').addEventListener('click', copyOut);
+  // 同じタブで別の鍵のURLを開いたときに、古い鍵のまま使わないようにする
+  window.addEventListener('hashchange', function () { location.reload(); });
+
+  init().catch(function () {
+    fail('初期化に失敗しました。ページを開き直してください。');
+  });
+})();
+</script>
+</body>
+</html>
