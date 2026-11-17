@@ -94,6 +94,80 @@ function Find-Ciphertext {
     return , $bytes
 }
 
+# 公開ページを取得してバイト列を返す。
+# まず IPv4 を優先して直接つなぐ (接続待ちは1アドレスあたり3秒)。.NET Framework の WebClient は
+# IPv6 のアドレスを先に1つずつ試すため、IPv6 がつながらない回線では起動に1分以上かかってしまう。
+# 直接つなげない環境 (プロキシ必須など) では WebClient に切り替える。
+function Get-PageBytes {
+    param([Uri]$Uri)
+
+    try {
+        $addresses = @([System.Net.Dns]::GetHostAddresses($Uri.DnsSafeHost))
+        $ordered = @($addresses | Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork } | Select-Object -First 2) +
+                   @($addresses | Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6 } | Select-Object -First 1)
+        foreach ($address in $ordered) {
+            $tcp = New-Object System.Net.Sockets.TcpClient -ArgumentList $address.AddressFamily
+            try {
+                $pending = $tcp.BeginConnect($address, $Uri.Port, $null, $null)
+                if (-not $pending.AsyncWaitHandle.WaitOne(3000)) { continue }
+                $tcp.EndConnect($pending)
+                $tcp.ReceiveTimeout = 10000
+                $tcp.SendTimeout = 10000
+
+                $stream = $tcp.GetStream()
+                if ($Uri.Scheme -eq 'https') {
+                    # 証明書の検証は既定のまま (ホスト名と証明書チェーンを確認する)
+                    $ssl = New-Object System.Net.Security.SslStream -ArgumentList $stream, $false
+                    $ssl.AuthenticateAsClient($Uri.DnsSafeHost, $null, [System.Security.Authentication.SslProtocols]::Tls12, $false)
+                    $stream = $ssl
+                }
+
+                # HTTP/1.0 で要求する (応答が分割転送にならず、本文をそのまま取り出せる)
+                $request = "GET {0} HTTP/1.0`r`nHost: {1}`r`nAccept-Encoding: identity`r`nCache-Control: no-cache`r`nConnection: close`r`n`r`n" -f $Uri.PathAndQuery, $Uri.Authority
+                $requestBytes = [System.Text.Encoding]::ASCII.GetBytes($request)
+                $stream.Write($requestBytes, 0, $requestBytes.Length)
+                $stream.Flush()
+
+                $buffer = New-Object System.IO.MemoryStream
+                $stream.CopyTo($buffer)
+                $response = $buffer.ToArray()
+
+                # ヘッダーと本文の境目 (CR LF CR LF) を探す
+                $split = -1
+                for ($i = 0; $i -le $response.Length - 4; $i++) {
+                    if ($response[$i] -eq 13 -and $response[$i + 1] -eq 10 -and $response[$i + 2] -eq 13 -and $response[$i + 3] -eq 10) {
+                        $split = $i
+                        break
+                    }
+                }
+                if ($split -lt 0) { continue }
+                $header = [System.Text.Encoding]::ASCII.GetString($response, 0, $split)
+                if ($header -notmatch '^HTTP/1\.[01] 200 ' -or $header -match '(?im)^Transfer-Encoding:') { continue }
+
+                $body = New-Object byte[] ($response.Length - $split - 4)
+                [Array]::Copy($response, $split + 4, $body, 0, $body.Length)
+                return , $body
+            } catch {
+                continue
+            } finally {
+                $tcp.Close()
+            }
+        }
+    } catch {
+        # 下の WebClient に任せる
+    }
+
+    $client = New-Object System.Net.WebClient
+    try {
+        [System.Net.ServicePointManager]::SecurityProtocol =
+            [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+        $client.Headers['Cache-Control'] = 'no-cache'
+        return , $client.DownloadData($Uri)
+    } finally {
+        $client.Dispose()
+    }
+}
+
 function Clear-ClipboardQuietly {
     for ($i = 0; $i -lt 10; $i++) {
         try {
@@ -205,18 +279,12 @@ if ($SkipPageCheck) {
 } else {
     Write-Host '公開ページの内容を確認しています...'
     $pageBytes = $null
-    $client = New-Object System.Net.WebClient
     try {
-        [System.Net.ServicePointManager]::SecurityProtocol =
-            [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
-        $client.Headers['Cache-Control'] = 'no-cache'
-        $pageBytes = $client.DownloadData($baseUrl)
+        $pageBytes = Get-PageBytes -Uri ([Uri]$baseUrl)
     } catch {
         Write-Host '公開ページを取得できませんでした。ネットワーク接続を確認してください。' -ForegroundColor Red
         Write-Host '  どうしても確認できない環境では -SkipPageCheck を付けると省略できます (安全性は下がります)。'
         exit 1
-    } finally {
-        $client.Dispose()
     }
     $pageHash = -join ((Get-Sha256 $pageBytes) | ForEach-Object { $_.ToString('x2') })
     if ($pageHash -cne $PinnedPageSha256.ToLowerInvariant()) {
@@ -271,7 +339,13 @@ try {
 
     # 2. 公開鍵入りのURLをクリップボードへ
     $url = '{0}#n={1}&e={2}' -f $baseUrl, (ConvertTo-Base64Url $pub.Modulus), (ConvertTo-Base64Url $pub.Exponent)
-    [System.Windows.Forms.Clipboard]::SetDataObject($url, $true, 10, 100)
+    try {
+        [System.Windows.Forms.Clipboard]::SetDataObject($url, $true, 10, 100)
+    } catch {
+        Write-Host 'クリップボードを使えませんでした。画面がロックされていないか、リモート接続で' -ForegroundColor Red
+        Write-Host 'クリップボードが禁止されていないかを確認して、もう一度実行してください。' -ForegroundColor Red
+        exit 1
+    }
 
     # 確認コード (modulus の SHA-256 の先頭16桁 = 64bit)。相手のページにも同じものが表示される
     $expectedCode = -join ((Get-Sha256 $pub.Modulus)[0..7] | ForEach-Object { $_.ToString('X2') })
