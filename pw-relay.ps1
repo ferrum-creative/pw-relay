@@ -4,10 +4,11 @@
     パスワード中継ツール (PC側)。
 
 .DESCRIPTION
-    1. RSA 3072bit の鍵ペアをメモリ上にだけ作り、公開鍵入りのURLをクリップボードへ入れる
-    2. 相手がそのURLのページでパスワードを暗号化し、暗号文 (PWR1:...) を送り返す
-    3. 暗号文をコピーして Enter を押すと復号し、結果を「履歴に残らない形」でクリップボードへ入れる
-    4. 貼り付けたら Enter。クリップボードを消去し、鍵を破棄する
+    1. 公開中の暗号化ページが、このスクリプトに記録した内容と同じかを確かめる
+    2. RSA 3072bit の鍵ペアをメモリ上にだけ作り、公開鍵入りのURLをクリップボードへ入れる
+    3. 確認コードを表示する (相手のページにも同じものが出る。照合は任意)
+    4. 相手から届いた暗号文 (PWR1:...) を復号し、履歴に残らない形でクリップボードへ入れる
+    5. 貼り付けたら Enter。クリップボードを消去し、鍵を破棄する
 
     復号結果は画面・ファイル・ログのどこにも出力しない。
     Windows PowerShell 5.1 と .NET Framework の標準機能だけで動く。
@@ -17,18 +18,23 @@
     https:// のみ受け付ける (ローカルテスト用の http://localhost は例外)。
 
 .PARAMETER ClearAfterSeconds
-    復号結果をクリップボードに置いておく最長時間 (秒)。Enter を押さなくても、
-    この時間が過ぎると自動で消去して終了する。0 を指定すると自動消去しない。
+    復号結果をクリップボードに置いておく時間 (秒)。この時間が過ぎると自動で消去して終了する。
+    待っている間に E キーで延長できる。0 を指定すると自動消去しない。
+
+.PARAMETER SkipPageCheck
+    公開ページの内容確認 (ハッシュ照合) を省略する。ネットワークの都合で確認できないとき専用。
 
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File .\pw-relay.ps1 -PageUrl https://example.github.io/pw-relay/
+    powershell -ExecutionPolicy Bypass -File .\pw-relay.ps1
 #>
 [CmdletBinding()]
 param(
     [string]$PageUrl = 'https://ferrum-creative.github.io/pw-relay/',
 
     [ValidateRange(0, 3600)]
-    [int]$ClearAfterSeconds = 60
+    [int]$ClearAfterSeconds = 60,
+
+    [switch]$SkipPageCheck
 )
 
 Set-StrictMode -Version 2.0
@@ -37,11 +43,25 @@ $ErrorActionPreference = 'Stop'
 $KeyBits = 3072
 $Prefix  = 'PWR1:'
 
+# 公開ページ (docs/index.html、改行 LF) の SHA-256。ページを書き換えたら必ず更新する。
+# 求め方は README の「ページを変更したとき」を参照。
+$PinnedPageSha256 = '417780eba11d153b14dfc06149d4aa49c009eca3ac02b2bc99ac8789f42b1698'
+
 Add-Type -AssemblyName System.Windows.Forms
 
 function ConvertTo-Base64Url {
     param([byte[]]$Bytes)
     return [Convert]::ToBase64String($Bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+}
+
+function Get-Sha256 {
+    param([byte[]]$Bytes)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return , $sha.ComputeHash($Bytes)
+    } finally {
+        $sha.Dispose()
+    }
 }
 
 # クリップボードの文字列から "PWR1:<base64>" を探し、暗号文のバイト列を返す。
@@ -74,21 +94,6 @@ function Find-Ciphertext {
     return , $bytes
 }
 
-# Win+V の履歴・クラウド同期・クリップボード監視ツールの対象から外して文字列を格納する
-function Set-SecretClipboard {
-    param([string]$Text)
-
-    $data = New-Object System.Windows.Forms.DataObject
-    $data.SetData([System.Windows.Forms.DataFormats]::UnicodeText, $Text)
-    $zero = [byte[]](0, 0, 0, 0)   # DWORD 0 = 許可しない
-    foreach ($format in @('ExcludeClipboardContentFromMonitorProcessing',
-                          'CanIncludeInClipboardHistory',
-                          'CanUploadToCloudClipboard')) {
-        $data.SetData($format, [System.IO.MemoryStream]::new($zero))
-    }
-    [System.Windows.Forms.Clipboard]::SetDataObject($data, $true, 10, 100)
-}
-
 function Clear-ClipboardQuietly {
     for ($i = 0; $i -lt 10; $i++) {
         try {
@@ -108,35 +113,73 @@ function Clear-ClipboardQuietly {
 }
 
 # Enter が押されるか制限時間が過ぎるまで待つ。Enter なら $true、時間切れなら $false。
-# 短い間隔で区切って待つので、途中の Ctrl+C にもすぐ反応する。
+# E キーで制限時間を延長する。$Seconds が 0 以下なら時間切れなし。
+#
+# 待っている間は 50 ミリ秒ごとにウィンドウメッセージを処理する。復号結果はこのプロセスが
+# 保持したまま貼り付け要求に応じて渡す方式 (終了と同時に消える) なので、
+# メッセージを処理しないと貼り付け先のアプリが固まる。
 function Wait-EnterOrTimeout {
     param([int]$Seconds)
 
-    if ($Seconds -le 0) {
-        [void](Read-Host '    Enter で消去して終了')
-        return $true
-    }
+    $noLimit = ($Seconds -le 0)
     $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
+    $redirected = [Console]::IsInputRedirected
+    $stdin = $null
+    $buffer = $null
+    $task = $null
 
-    if ([Console]::IsInputRedirected) {
-        # 標準入力がパイプやファイルのとき (自動テスト用)
+    if ($redirected) {
+        # 標準入力がパイプやファイルのとき (自動テスト用)。空行 = Enter、e で始まる行 = 延長
+        $stdin = [Console]::OpenStandardInput()
         $buffer = New-Object byte[] 256
-        $task = [Console]::OpenStandardInput().ReadAsync($buffer, 0, $buffer.Length)
-        while ([DateTime]::UtcNow -lt $deadline) {
-            if ($task.Wait(200)) { return $true }
-        }
-        return $false
+        $task = $stdin.ReadAsync($buffer, 0, $buffer.Length)
+    } else {
+        # 先に押されていたキーは捨てる (うっかり押した Enter で即消去されないように)
+        while ([Console]::KeyAvailable) { [void][Console]::ReadKey($true) }
     }
 
-    # 先に押されていたキーは捨てる (うっかり押した Enter で即消去されないように)
-    while ([Console]::KeyAvailable) { [void][Console]::ReadKey($true) }
-    while ([DateTime]::UtcNow -lt $deadline) {
-        while ([Console]::KeyAvailable) {
-            if ([Console]::ReadKey($true).Key -eq [ConsoleKey]::Enter) { return $true }
+    $shown = -1
+    while ($true) {
+        [System.Windows.Forms.Application]::DoEvents()
+
+        $remain = [int][Math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalSeconds)
+        if (-not $noLimit -and $remain -le 0) {
+            if (-not $redirected) { Write-Host '' }
+            return $false
         }
-        Start-Sleep -Milliseconds 100
+
+        $action = $null
+        if ($redirected) {
+            if ($task.Wait(50)) {
+                $count = $task.Result
+                if ($count -gt 0 -and ($buffer[0] -eq 0x65 -or $buffer[0] -eq 0x45)) {
+                    $action = 'extend'
+                    $task = $stdin.ReadAsync($buffer, 0, $buffer.Length)
+                } else {
+                    $action = 'enter'
+                }
+            }
+        } else {
+            while ([Console]::KeyAvailable) {
+                $key = [Console]::ReadKey($true).Key
+                if ($key -eq [ConsoleKey]::Enter) { $action = 'enter' }
+                elseif ($key -eq [ConsoleKey]::E -and $action -ne 'enter') { $action = 'extend' }
+            }
+            if (-not $noLimit -and $remain -ne $shown) {
+                Write-Host ("`r    残り {0,4} 秒   [Enter] 消去して終了   [E] 延長 " -f $remain) -NoNewline
+                $shown = $remain
+            }
+            Start-Sleep -Milliseconds 50
+        }
+
+        if ($action -eq 'enter') {
+            if (-not $redirected) { Write-Host '' }
+            return $true
+        }
+        if ($action -eq 'extend' -and -not $noLimit) {
+            $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
+        }
     }
-    return $false
 }
 
 # ---- 事前チェック ----------------------------------------------------------
@@ -151,13 +194,46 @@ if ($PageUrl -notmatch '^(https://|http://(localhost|127\.0\.0\.1)(:\d+)?/)') {
     Write-Host '  スクリプト冒頭の param の既定値を https:// のURLに書き換えてください。'
     exit 1
 }
-$baseUrl = ($PageUrl -split '#')[0]
+$baseUrl  = ($PageUrl -split '#')[0]
+$pageHost = ([Uri]$baseUrl).Authority
+
+# 公開中のページが、記録してある内容と同じかを確かめる。
+# GitHub アカウントの乗っ取りなどでページを書き換えられた場合に、ここで止まる。
+# (確かめられるのはこの PC が受け取った内容だけ。相手のスマホに届く内容までは保証できない)
+if ($SkipPageCheck) {
+    Write-Host '注意: 公開ページの内容確認を省略しました (-SkipPageCheck)。' -ForegroundColor Yellow
+} else {
+    Write-Host '公開ページの内容を確認しています...'
+    $pageBytes = $null
+    $client = New-Object System.Net.WebClient
+    try {
+        [System.Net.ServicePointManager]::SecurityProtocol =
+            [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+        $client.Headers['Cache-Control'] = 'no-cache'
+        $pageBytes = $client.DownloadData($baseUrl)
+    } catch {
+        Write-Host '公開ページを取得できませんでした。ネットワーク接続を確認してください。' -ForegroundColor Red
+        Write-Host '  どうしても確認できない環境では -SkipPageCheck を付けると省略できます (安全性は下がります)。'
+        exit 1
+    } finally {
+        $client.Dispose()
+    }
+    $pageHash = -join ((Get-Sha256 $pageBytes) | ForEach-Object { $_.ToString('x2') })
+    if ($pageHash -cne $PinnedPageSha256.ToLowerInvariant()) {
+        Write-Host '公開中のページが、このスクリプトに記録された内容と一致しません。使用を中止します。' -ForegroundColor Red
+        Write-Host '  ・ページを更新した直後なら、反映まで 10 分ほど待ってからやり直してください。'
+        Write-Host '  ・自分でページを書き換えたなら、$PinnedPageSha256 を更新してください (README 参照)。'
+        Write-Host '  ・心当たりがなければ、ページが改ざんされた可能性があります。GitHub アカウントを確認してください。'
+        exit 1
+    }
+}
 
 # ---- 本体 ------------------------------------------------------------------
 
 $rsa = $null
 $secretOnClipboard = $false
 $plainText = $null
+$data = $null
 
 try {
     # 1. 鍵ペアをメモリ上にだけ作る (名前なしの一時鍵。ディスクには保存されない)
@@ -166,34 +242,53 @@ try {
     $pub = $rsa.ExportParameters($false)
     $cipherBytes = $pub.Modulus.Length
 
+    # 見張り役の別プロセスを起動する。このスクリプトが終了したとき (ウィンドウを × で閉じた、
+    # 強制終了されたなど、finally が走らない場合を含む) に、復号結果がクリップボードに
+    # 残っていれば消去する。一度でも貼り付けが行われるとデータは Windows 側に渡るため、
+    # プロセスが消えるだけでは消えない。渡すのはプロセスIDと目印の名前だけで、秘密は渡さない。
+    $marker = 'PwRelay-' + [Guid]::NewGuid().ToString('N')
+    #
+    # スクリプトが動いている間、クリップボードに目印があるかを 0.4 秒ごとに見ておき、
+    # 「最後に見たとき目印があった」状態でスクリプトが終了したら消去する。
+    # (終了後に目印を探しても見つからない。持ち主のプロセスが消えると、貼り付け済みの
+    #  テキストだけが残り、目印は消えるため)
+    $watchdog = "Add-Type -AssemblyName System.Windows.Forms; " +
+                "`$seen = `$false; `$parent = Get-Process -Id $PID -ErrorAction SilentlyContinue; " +
+                "while (`$parent -and -not `$parent.HasExited) { " +
+                "try { `$seen = [System.Windows.Forms.Clipboard]::ContainsData('$marker') } catch { }; " +
+                "Start-Sleep -Milliseconds 400 }; " +
+                "if (`$seen) { for (`$i = 0; `$i -lt 30; `$i++) { " +
+                "try { [System.Windows.Forms.Clipboard]::Clear(); break } catch { Start-Sleep -Milliseconds 100 } } }"
+    $watchdogStarted = $false
+    try {
+        Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -WindowStyle Hidden `
+            -ArgumentList "-NoProfile -STA -NonInteractive -Command $watchdog" | Out-Null
+        $watchdogStarted = $true
+    } catch {
+        Write-Host '注意: 見張り役のプロセスを起動できませんでした。必ず Enter か Ctrl+C で終了してください' -ForegroundColor Yellow
+        Write-Host '      (ウィンドウを × で閉じると、復号結果がクリップボードに残ることがあります)。' -ForegroundColor Yellow
+    }
+
     # 2. 公開鍵入りのURLをクリップボードへ
     $url = '{0}#n={1}&e={2}' -f $baseUrl, (ConvertTo-Base64Url $pub.Modulus), (ConvertTo-Base64Url $pub.Exponent)
     [System.Windows.Forms.Clipboard]::SetDataObject($url, $true, 10, 100)
 
-    # 3. 指紋 (modulus の SHA-256 の先頭16桁 = 64bit)。
-    #    8桁 (32bit) では、同じ指紋になる偽の鍵を短時間で作れてしまう
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        $hash = $sha.ComputeHash($pub.Modulus)
-    } finally {
-        $sha.Dispose()
-    }
-    $hex = -join ($hash[0..7] | ForEach-Object { $_.ToString('X2') })
-    $fingerprint = ($hex -split '(.{4})' | Where-Object { $_ }) -join ' '
+    # 確認コード (modulus の SHA-256 の先頭16桁 = 64bit)。相手のページにも同じものが表示される
+    $expectedCode = -join ((Get-Sha256 $pub.Modulus)[0..7] | ForEach-Object { $_.ToString('X2') })
 
     Write-Host ''
     Write-Host '[1] URLをクリップボードにコピーしました。Teams のチャットに貼り付けて相手に送ってください。'
     Write-Host ''
     Write-Host '    確認コード:  ' -NoNewline
-    Write-Host $fingerprint -ForegroundColor Yellow
-    Write-Host ''
-    Write-Host '    相手のページに表示される確認コードを読み上げてもらい、上と一致することを確かめてください。'
-    Write-Host '    一致しない場合は中止してください (Ctrl+C)。'
+    Write-Host (($expectedCode -split '(.{4})' | Where-Object { $_ }) -join ' ') -ForegroundColor Yellow
+    Write-Host '    (相手のページにも同じコードが出ます。照合は任意です。URLが途中で書き換えられる'
+    Write-Host '     心配があるときだけ、声で読み合わせてください)'
     Write-Host ''
 
     # 4. 暗号文を受け取って復号する。失敗したらやり直し
     while ($true) {
         Write-Host "[2] 相手から届いた暗号文 ($Prefix...) をコピーしてから Enter を押してください。"
+        Write-Host '    Enter を押すと復号結果がクリップボードに入ります。画面共有中なら、先に止めてください。' -ForegroundColor Yellow
         [void](Read-Host '    Enter で復号')
 
         $clip = $null
@@ -237,33 +332,66 @@ try {
             continue
         }
 
-        # 5. 復号結果は画面に出さず、履歴に残らない形でクリップボードへ
+        # 5. 復号結果は画面に出さず、履歴に残らない形でクリップボードへ。
+        #    平文はコマンドレットや関数の引数に渡さない (PowerShell のログ機能は引数を記録するため)。
+        #    .NET のメソッド呼び出しだけで扱う。
+        $decodeFailed = $false
         try {
-            $plainText = [System.Text.Encoding]::UTF8.GetString($plainBytes)
+            $plainText = [System.Text.UTF8Encoding]::new($false, $true).GetString($plainBytes)
+        } catch {
+            $decodeFailed = $true
         } finally {
             [Array]::Clear($plainBytes, 0, $plainBytes.Length)
         }
-        $secretOnClipboard = $true
-        Set-SecretClipboard -Text $plainText
-        $charCount = (New-Object System.Globalization.StringInfo -ArgumentList $plainText).LengthInTextElements
+        if ($decodeFailed -or [regex]::IsMatch($plainText, '[\x00-\x1F\x7F]')) {
+            $plainText = $null
+            Write-Host '    復号結果に改行などの制御文字が含まれているため、破棄しました。' -ForegroundColor Yellow
+            Write-Host '    もう一度暗号化して送ってもらってください。' -ForegroundColor Yellow
+            Write-Host ''
+            continue
+        }
+
+        # 溜まっているウィンドウメッセージを先に処理しておく。入力待ちの間に他のアプリが
+        # クリップボードを書き換えると (暗号文のコピーがまさにそれ)、その通知が未処理のまま残る。
+        # 残したまま下でセットすると、あとから通知が処理されて新しいデータのほうが無効になり、
+        # 貼り付けても空になる。
+        [System.Windows.Forms.Application]::DoEvents()
+
+        $data = New-Object System.Windows.Forms.DataObject
+        $data.SetData([System.Windows.Forms.DataFormats]::UnicodeText, $plainText)
         $plainText = $null
+        # Win+V の履歴・クラウド同期・クリップボード監視ツールの対象から外す (DWORD 0 = 許可しない)
+        foreach ($format in @('ExcludeClipboardContentFromMonitorProcessing',
+                              'CanIncludeInClipboardHistory',
+                              'CanUploadToCloudClipboard')) {
+            $data.SetData($format, [System.IO.MemoryStream]::new([byte[]](0, 0, 0, 0)))
+        }
+        # 見張り役のプロセスが「これは pw-relay が入れたデータだ」と見分けるための目印
+        $data.SetData($marker, [System.IO.MemoryStream]::new([byte[]](1)))
+        $secretOnClipboard = $true
+        # 第2引数 $false: データをこのプロセスが持ったままにし、貼り付け要求が来たときに渡す。
+        # まだ一度も貼り付けられていなければ、プロセスが消えた時点で貼り付けできなくなる。
+        [System.Windows.Forms.Clipboard]::SetDataObject($data, $false, 10, 100)
         break
     }
 
     Write-Host ''
-    Write-Host "[3] 復号しました ($charCount 文字)。クリップボードに入っています。" -ForegroundColor Green
-    Write-Host '    ログイン画面のパスワード欄に貼り付けて (Ctrl+V) ください。'
-    Write-Host '    Win+V の履歴とクラウド同期には残りません。'
-    Write-Host ''
-
-    # 6. 貼り付けが済んだら消去 (実際の後始末は finally で行う)
+    Write-Host '[3] 復号しました。パスワード欄にだけ貼り付けて (Ctrl+V) ください (チャット欄には貼らない)。' -ForegroundColor Green
+    if ($watchdogStarted) {
+        Write-Host '    Win+V の履歴とクラウド同期には残りません。このウィンドウを閉じた場合も自動で消去します。'
+    } else {
+        Write-Host '    Win+V の履歴とクラウド同期には残りません。'
+    }
     if ($ClearAfterSeconds -gt 0) {
-        Write-Host "    貼り付けが終わったら Enter を押してください。押さなくても $ClearAfterSeconds 秒後に自動で消去します。"
+        Write-Host "    $ClearAfterSeconds 秒たつと自動で消去します。"
     } else {
         Write-Host '    貼り付けが終わったら Enter を押してください (クリップボードを消去して終了します)。'
     }
+    Write-Host ''
+
+    # 6. 貼り付けが済んだら消去 (実際の後始末は finally で行う)
     if (-not (Wait-EnterOrTimeout -Seconds $ClearAfterSeconds)) {
-        Write-Host "    $ClearAfterSeconds 秒たったので自動で消去します。" -ForegroundColor Yellow
+        Write-Host '    時間切れのため自動で消去します。' -ForegroundColor Yellow
     }
 }
 finally {
@@ -271,11 +399,12 @@ finally {
     $plainText = $null
     if ($secretOnClipboard) {
         if (Clear-ClipboardQuietly) {
-            Write-Host 'クリップボードを消去しました。'
+            Write-Host '消去済み: クリップボードを空にしました。' -ForegroundColor Green
         } else {
             Write-Host 'クリップボードを消去できませんでした。何か別の文字をコピーして上書きしてください。' -ForegroundColor Red
         }
     }
+    $data = $null
     if ($null -ne $rsa) {
         $rsa.Dispose()
         Write-Host '鍵を破棄しました。'

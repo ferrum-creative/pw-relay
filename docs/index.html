@@ -32,11 +32,6 @@
   h2 { font-size: 16px; margin: 0 0 8px; }
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 12px; }
   .sub { color: var(--sub); font-size: 14px; margin: 6px 0 0; }
-  .fp {
-    font: 700 24px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    letter-spacing: 0.04em; text-align: center; background: var(--code-bg);
-    border-radius: 8px; padding: 12px 8px; user-select: all;
-  }
   input[type=password], textarea {
     width: 100%; font-size: 16px; padding: 12px; color: var(--fg); background: var(--bg);
     border: 1px solid var(--line); border-radius: 8px;
@@ -55,6 +50,8 @@
     color: var(--accent-fg); background: var(--accent); border: 0; border-radius: 10px;
   }
   button:disabled { opacity: 0.5; }
+  .code { color: var(--sub); font-size: 13px; text-align: center; margin: 16px 0 0; }
+  .code span { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-weight: 700; color: var(--fg); letter-spacing: 0.04em; }
   .msg { font-size: 14px; margin: 8px 0 0; min-height: 1.6em; }
   .msg.ok { color: var(--ok); font-weight: 700; }
   .msg.ng { color: var(--err-fg); font-weight: 700; }
@@ -76,13 +73,7 @@
 
   <div id="app" hidden>
     <section class="card">
-      <h2>1. 確認コード</h2>
-      <div id="fp" class="fp">---- ---- ---- ----</div>
-      <p class="sub">この16桁を会議で読み上げ、相手のコードと<strong>全部同じ</strong>であることを確かめてください。違う場合は、パスワードを入力しないでください。</p>
-    </section>
-
-    <section class="card">
-      <h2>2. パスワードを入力</h2>
+      <h2>1. パスワードを入力</h2>
       <input id="pw" type="password" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" aria-label="パスワード">
       <label class="chk"><input id="show" type="checkbox">入力した文字を表示する</label>
       <div id="reveal" class="reveal" hidden aria-live="off"></div>
@@ -91,12 +82,14 @@
     </section>
 
     <section id="result" class="card" hidden>
-      <h2>3. 暗号文をコピーして送る</h2>
+      <h2>2. 暗号文をコピーして送る</h2>
       <textarea id="out" readonly aria-label="暗号文"></textarea>
       <button id="copy" type="button">コピー</button>
       <p id="copyMsg" class="msg"></p>
       <p class="sub">コピーした暗号文を、会議のチャットにそのまま貼り付けて送信してください。暗号文は相手のPCでしか元に戻せません。</p>
     </section>
+
+    <p class="code">確認コード <span id="fp">---- ---- ---- ----</span><br>相手に聞かれたときだけ読み上げてください。</p>
   </div>
 
   <footer>このページは通信を一切行いません。入力した内容はこの端末の中で暗号化されます。</footer>
@@ -269,6 +262,21 @@
       msg.textContent = '自動でコピーできませんでした。上の枠を長押しして「すべて選択」→「コピー」してください。';
     }
   }
+
+  // 入力したまま放置されたら消す
+  var idleTimer = null;
+  function armIdleClear() {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(function () {
+      if ($('pw').value.length > 0) {
+        $('pw').value = '';
+        $('show').checked = false;
+        updateReveal();
+        $('encMsg').textContent = '2分間操作がなかったため、入力を消しました。';
+      }
+    }, 120000);
+  }
+  $('pw').addEventListener('input', armIdleClear);
 
   $('pw').addEventListener('input', updateReveal);
   $('pw').addEventListener('keydown', function (ev) {

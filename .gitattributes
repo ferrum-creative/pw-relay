@@ -1,2 +1,4 @@
 * text=auto
 *.ps1 text eol=crlf
+# 公開ページは SHA-256 を pw-relay.ps1 に固定しているので、改行を LF に固定する
+docs/index.html text eol=lf
